@@ -59,28 +59,50 @@ check_shortcut() {
 # 获取系统架构和类型
 get_arch_os() {
     ARCH=$(uname -m)
-    if [[ "$ARCH" == "x86_64" ]]; then
-        REALM_ARCH="x86_64"
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        REALM_ARCH="aarch64"
-    else
-        echo -e "${RED}不支持的架构: $ARCH${PLAIN}"
-        exit 1
+    case "$ARCH" in
+        x86_64|amd64)
+            REALM_ARCH="x86_64"
+            ;;
+        aarch64|arm64)
+            REALM_ARCH="aarch64"
+            ;;
+        *)
+            echo -e "${RED}不支持的架构: $ARCH${PLAIN}"
+            exit 1
+            ;;
+    esac
+
+    # Realm 的 GNU 构建会依赖构建环境中的 glibc 版本，可能无法在较旧的
+    # Debian/Ubuntu 上运行。官方 musl 构建为静态链接，可同时用于
+    # Debian/Ubuntu 和 Alpine，从而避免 GLIBC_x.y 版本不匹配。
+    REALM_OS="unknown-linux-musl"
+}
+
+# 仅在二进制确实可以运行并输出版本号时返回成功。
+get_realm_version() {
+    local binary="$1"
+    local version_output
+    local version
+
+    if ! version_output=$("$binary" --version 2>/dev/null); then
+        return 1
     fi
 
-    if [ "$IS_ALPINE" -eq 1 ]; then
-        REALM_OS="unknown-linux-musl"
-    else
-        REALM_OS="unknown-linux-gnu"
-    fi
+    version=$(printf '%s\n' "$version_output" | awk 'NF >= 2 { print $2; exit }')
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
 }
 
 # 获取 Realm 状态
 get_status() {
     # 1. 安装状态
     if [ -f "$REALM_BIN" ]; then
-        local ver=$($REALM_BIN --version | awk '{print $2}')
-        INSTALL_STATUS="${GREEN}已安装 (版本: $ver)${PLAIN}"
+        local ver
+        if ver=$(get_realm_version "$REALM_BIN"); then
+            INSTALL_STATUS="${GREEN}已安装 (版本: $ver)${PLAIN}"
+        else
+            INSTALL_STATUS="${RED}已安装但无法运行（请重新安装/更新）${PLAIN}"
+        fi
     else
         INSTALL_STATUS="${RED}未安装${PLAIN}"
     fi
@@ -118,7 +140,9 @@ install_realm() {
     get_arch_os
     
     echo -e "${GREEN}正在获取 GitHub 最新版本信息...${PLAIN}"
-    LATEST_TAG=$(curl -s "https://api.github.com/repos/zhboner/realm/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    LATEST_TAG=$(curl -fsSL --connect-timeout 15 --retry 2 \
+        "https://api.github.com/repos/zhboner/realm/releases/latest" 2>/dev/null \
+        | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
     
     if [[ -z "$LATEST_TAG" ]]; then
         echo -e "${RED}获取版本信息失败，请检查网络连接。${PLAIN}"
@@ -129,52 +153,82 @@ install_realm() {
     echo -e "最新版本为: ${GREEN}$LATEST_TAG${PLAIN}"
 
     if [ -f "$REALM_BIN" ]; then
-        CURRENT_VER=$($REALM_BIN --version | awk '{print $2}')
-        TAG_NUM=$(echo $LATEST_TAG | sed 's/^v//')
-        CUR_NUM=$(echo $CURRENT_VER | sed 's/^v//')
-        
-        if [[ "$TAG_NUM" == "$CUR_NUM" ]]; then
-            echo -e "${YELLOW}当前已是最新版本，无需更新。${PLAIN}"
-            wait_for_key
-            return
-        else
-            echo -e "${YELLOW}发现新版本 (当前: $CURRENT_VER, 最新: $LATEST_TAG)${PLAIN}"
-            read -p "是否更新？[y/n]: " choice
-            if [[ "$choice" != "y" && "$choice" != "Y" ]]; then
+        if CURRENT_VER=$(get_realm_version "$REALM_BIN"); then
+            TAG_NUM=$(echo "$LATEST_TAG" | sed 's/^v//')
+            CUR_NUM=$(echo "$CURRENT_VER" | sed 's/^v//')
+
+            if [[ "$TAG_NUM" == "$CUR_NUM" ]]; then
+                echo -e "${YELLOW}当前已是最新版本，无需更新。${PLAIN}"
                 wait_for_key
                 return
+            else
+                echo -e "${YELLOW}发现新版本 (当前: $CURRENT_VER, 最新: $LATEST_TAG)${PLAIN}"
+                read -p "是否更新？[y/n]: " choice
+                if [[ "$choice" != "y" && "$choice" != "Y" ]]; then
+                    wait_for_key
+                    return
+                fi
             fi
+        else
+            echo -e "${YELLOW}现有 Realm 无法运行，将使用无 glibc 依赖的 musl 版本修复安装。${PLAIN}"
         fi
     fi
 
-    DOWNLOAD_URL="https://github.com/zhboner/realm/releases/download/${LATEST_TAG}/realm-${REALM_ARCH}-${REALM_OS}.tar.gz"
-    
-    rm -f /tmp/realm.tar.gz
-    rm -f /tmp/realm
+    ARCHIVE_NAME="realm-${REALM_ARCH}-${REALM_OS}.tar.gz"
+    DOWNLOAD_URL="https://github.com/zhboner/realm/releases/download/${LATEST_TAG}/${ARCHIVE_NAME}"
+    TEMP_DIR=$(mktemp -d /tmp/realm-install.XXXXXX)
 
-    echo -e "${GREEN}正在下载: realm-${REALM_ARCH}-${REALM_OS}.tar.gz ...${PLAIN}"
-    curl -L -o /tmp/realm.tar.gz "$DOWNLOAD_URL"
-    
-    if [ $? -ne 0 ]; then
+    if [ -z "$TEMP_DIR" ] || [ ! -d "$TEMP_DIR" ]; then
+        echo -e "${RED}无法创建临时目录！${PLAIN}"
+        wait_for_key
+        return
+    fi
+
+    echo -e "${GREEN}正在下载: ${ARCHIVE_NAME}（静态 musl 版本）...${PLAIN}"
+    if ! curl -fL --show-error --connect-timeout 15 --retry 3 \
+        -o "$TEMP_DIR/realm.tar.gz" "$DOWNLOAD_URL"; then
         echo -e "${RED}下载失败！${PLAIN}"
+        rm -rf "$TEMP_DIR"
         wait_for_key
         return
     fi
 
     echo -e "${GREEN}正在安装...${PLAIN}"
-    tar -xzvf /tmp/realm.tar.gz -C /tmp
-    
-    if [ ! -f "/tmp/realm" ]; then
-        echo -e "${RED}解压失败或文件不存在！请检查下载文件是否完整。${PLAIN}"
+    if ! tar -xzf "$TEMP_DIR/realm.tar.gz" -C "$TEMP_DIR"; then
+        echo -e "${RED}解压失败，请检查下载文件是否完整。${PLAIN}"
+        rm -rf "$TEMP_DIR"
         wait_for_key
         return
     fi
 
-    mv /tmp/realm "$REALM_BIN"
-    chmod +x "$REALM_BIN"
-    rm -f /tmp/realm.tar.gz
+    if [ ! -f "$TEMP_DIR/realm" ]; then
+        echo -e "${RED}解压失败或文件不存在！请检查下载文件是否完整。${PLAIN}"
+        rm -rf "$TEMP_DIR"
+        wait_for_key
+        return
+    fi
 
-    echo -e "${GREEN}Realm 安装/更新成功！${PLAIN}"
+    chmod +x "$TEMP_DIR/realm"
+    if ! NEW_VER=$(get_realm_version "$TEMP_DIR/realm"); then
+        echo -e "${RED}下载的 Realm 无法在当前系统运行，已保留原有安装。${PLAIN}"
+        rm -rf "$TEMP_DIR"
+        wait_for_key
+        return
+    fi
+
+    # 先写入同目录的临时文件，通过自检后再原子替换，避免破坏现有安装。
+    if ! cp "$TEMP_DIR/realm" "${REALM_BIN}.new" \
+        || ! chmod +x "${REALM_BIN}.new" \
+        || ! mv -f "${REALM_BIN}.new" "$REALM_BIN"; then
+        echo -e "${RED}安装失败，未能写入 $REALM_BIN。${PLAIN}"
+        rm -f "${REALM_BIN}.new"
+        rm -rf "$TEMP_DIR"
+        wait_for_key
+        return
+    fi
+    rm -rf "$TEMP_DIR"
+
+    echo -e "${GREEN}Realm 安装/更新成功！版本: $NEW_VER（静态 musl，无 glibc 版本依赖）${PLAIN}"
     wait_for_key
 }
 
